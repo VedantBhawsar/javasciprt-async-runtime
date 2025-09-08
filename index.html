@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Mini Async Runtime Demo</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin: 18px; background:#f7f8fb; color:#111; }
+  header { display:flex; align-items:center; gap:12px; margin-bottom:12px; }
+  h1 { font-size:20px; margin:0; }
+  .controls { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  button { padding:8px 12px; border-radius:8px; border:1px solid rgba(0,0,0,0.08); background:white; cursor:pointer; }
+  .grid { display:grid; grid-template-columns: 350px 1fr; gap:12px; }
+  .card { background:white; border-radius:10px; padding:12px; box-shadow: 0 6px 20px rgba(10,10,20,0.04); }
+  label { display:block; margin-bottom:6px; font-size:13px; color:#444; }
+  .queue-stats { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
+  .stat { background:#fafafa; padding:8px 10px; border-radius:8px; font-size:13px; border:1px solid #eee; min-width:110px; text-align:center; }
+  pre.log { height:320px; overflow:auto; background:#0f1724; color:#dbeafe; padding:10px; border-radius:8px; font-size:12px; }
+  .task-list { max-height:320px; overflow:auto; }
+  .task-item { padding:8px; border-bottom:1px dashed #eee; display:flex; justify-content:space-between; gap:8px; align-items:center; }
+  .task-item .meta { color:#555; font-size:13px; }
+  .small { font-size:12px; color:#666; }
+  footer { margin-top:12px; font-size:12px; color:#555; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mini Async Runtime — Cooperative Scheduler (Generator coroutines)</h1>
+</header>
+
+<div class="controls">
+  <button id="startBtn">Start Runtime</button>
+  <button id="stopBtn">Stop Runtime</button>
+  <button id="addCpu">Spawn CPU Task</button>
+  <button id="addIo">Spawn IO Task</button>
+  <label class="small" style="align-self:center;">
+    Priority:
+    <select id="prioritySelect"><option value="0">0 (normal)</option><option value="1">1 (high)</option><option value="-1">-1 (low)</option></select>
+  </label>
+  <button id="clearLog">Clear Log</button>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="queue-stats">
+      <div class="stat">Tasks: <span id="tasksCount">0</span></div>
+      <div class="stat">Microtasks: <span id="microCount">0</span></div>
+      <div class="stat">Macrotasks: <span id="macroCount">0</span></div>
+      <div class="stat">Timers: <span id="timerCount">0</span></div>
+    </div>
+
+    <label>Task List</label>
+    <div class="task-list" id="taskList"></div>
+    <hr />
+    <label>Examples / Quick explanation</label>
+    <div class="small">
+      <p><strong>cpu task</strong>: simulates CPU work split into chunks and yields regularly so the scheduler can run other tasks.</p>
+      <p><strong>io task</strong>: sleeps for a while (timer) then awaits a Promise (demonstrating Promise interop)</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>Log (runtime events)</label>
+    <pre class="log" id="logArea"></pre>
+  </div>
+</div>
+
+<footer>
+  Generator coroutines + scheduler demo. Save as <code>async-runtime-demo.html</code> and open in your browser.
+</footer>
+
+<script>
+/*
+  Mini Async Runtime (cooperative coroutine scheduler using generator functions)
+
+  Key ideas:
+  - Tasks are generator functions that yield "instructions":
+      - `sleep(ms)` -> runtime registers a timer and pauses the task
+      - `yieldNow()` -> voluntarily give up CPU, requeue as microtask
+      - yielding a Promise -> runtime will resume the task when the promise resolves (promise interop)
+      - yielding any other value -> treated as immediate value (continues next microtask)
+  - Scheduler maintains:
+      - microtaskQueue (high priority, local continuations & promise resolutions)
+      - macrotaskQueue (callbacks)
+      - timerQueue (wake up tasks when time arrives)
+  - This is cooperative: tasks must yield periodically to allow concurrency.
+*/
+
+//////////////////////////////////////////////////////////////////////
+// Helper "instruction" functions for generator tasks
+function sleep(ms) { return { __type: 'sleep', ms }; }
+function yieldNow() { return { __type: 'yield' }; }
+
+//////////////////////////////////////////////////////////////////////
+// Task class - wraps a generator coroutine
+class Task {
+  constructor(id, gen, runtime, { priority = 0, name = null } = {}) {
+    this.id = id;
+    this.generator = gen;
+    this.runtime = runtime;
+    this.priority = priority;
+    this.name = name || `task#${id}`;
+    this.cancelled = false;
+    this.done = false;
+
+    // Promise control so user can await a task finishing
+    this._promise = new Promise((resolve, reject) => {
+      this._resolve = resolve;
+      this._reject = reject;
+    });
+  }
+
+  // Expose a promise for external awaiting
+  asPromise() { return this._promise; }
+
+  // Cancel the task
+  cancel() {
+    this.cancelled = true;
+    if (!this.done) {
+      this.done = true;
+      this._reject(new Error('Task cancelled'));
+    }
+    this.runtime._log(`[task ${this.name}] cancelled`);
+  }
+
+  // Internal: step the generator with a value or throw an error
+  _step(value, isError = false) {
+    if (this.done || this.cancelled) return;
+    try {
+      const result = isError ? this.generator.throw(value) : this.generator.next(value);
+      if (result.done) {
+        this.done = true;
+        this.runtime.tasks.delete(this.id);
+        this._resolve(result.value);
+        this.runtime._log(`[task ${this.name}] completed -> ${String(result.value)}`);
+        return;
+      }
+
+      // Inspect yielded value to decide what to do next
+      const yielded = result.value;
+      if (yielded && yielded.__type === 'sleep') {
+        // register timer to wake task
+        this.runtime._registerTimer(this, yielded.ms);
+        this.runtime._log(`[task ${this.name}] sleeping ${yielded.ms}ms`);
+      } else if (yielded && yielded.__type === 'yield') {
+        // requeue as microtask (cooperative yield)
+        this.runtime._enqueueMicrotask(this, undefined);
+      } else if (yielded && typeof yielded.then === 'function') {
+        // yielded a Promise -> handle interop
+        yielded.then(v => {
+          this.runtime._enqueueMicrotask(this, v);
+        }).catch(err => {
+          this.runtime._enqueueMicrotask(this, err, true);
+        });
+      } else {
+        // immediate value: continue soon as microtask
+        this.runtime._enqueueMicrotask(this, yielded);
+      }
+    } catch (err) {
+      // Unhandled error from generator: mark done and reject
+      this.done = true;
+      this.runtime.tasks.delete(this.id);
+      this._reject(err);
+      this.runtime._log(`[task ${this.name}] error -> ${err && err.stack ? err.stack.split('\n')[0] : String(err)}`);
+    }
+  }
+}
+
+//////////////////////////////////////////////////////////////////////
+// AsyncRuntime - the main scheduler / loop
+class AsyncRuntime {
+  constructor({ logCallback = null } = {}) {
+    this.microtaskQueue = [];   // immediate continuations (task -> next step)
+    this.macrotaskQueue = [];   // user enqueued callbacks
+    this.timerQueue = [];       // sorted by wake time: { wake, task }
+    this.tasks = new Map();     // active Task instances
+    this.nextTaskId = 1;
+    this.running = false;
+    this._logCallback = logCallback;
+    this._tickScheduled = false;
+    this.maxMicroPerTick = 50;  // safety cap to avoid starving browser UI
+  }
+
+  // Logging helper
+  _log(...args) {
+    if (this._logCallback) this._logCallback(args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' '));
+    else console.log(...args);
+  }
+
+  // Create/spawn a coroutine. Accepts either a generator function (function* () {...})
+  // or a generator object (the result of calling a generator function).
+  spawn(genOrFunc, opts = {}) {
+    let gen;
+    if (typeof genOrFunc === 'function') {
+      gen = genOrFunc();
+    } else {
+      gen = genOrFunc;
+    }
+    if (!gen || typeof gen.next !== 'function') {
+      throw new Error('spawn expects a generator function or generator object (use function*())');
+    }
+    const id = this.nextTaskId++;
+    const task = new Task(id, gen, this, opts);
+    this.tasks.set(id, task);
+    this._enqueueMicrotask(task, undefined); // schedule first step
+    this._log(`[spawn] ${task.name} (priority ${task.priority})`);
+    this._ensureTick();
+    return task;
+  }
+
+  // Enqueue microtask (continuation). Microtasks are prioritized by Task.priority.
+  _enqueueMicrotask(task, value, isError = false) {
+    if (task.cancelled || task.done) return;
+    const entry = { task, value, isError, priority: task.priority, id: task.id, time: Date.now() };
+    // insert by priority (higher first), then FIFO
+    let i = this.microtaskQueue.findIndex(e => (e.priority < entry.priority) || (e.priority === entry.priority && e.id > entry.id));
+    if (i === -1) this.microtaskQueue.push(entry); else this.microtaskQueue.splice(i, 0, entry);
+    this._ensureTick();
+  }
+
+  // Enqueue a macrotask (normal callback)
+  enqueueMacrotask(fn) {
+    this.macrotaskQueue.push(fn);
+    this._ensureTick();
+  }
+
+  // Register a timer to wake a task after ms milliseconds
+  _registerTimer(task, ms) {
+    const wake = Date.now() + ms;
+    const entry = { wake, task };
+    // insert sorted by wake time
+    let i = this.timerQueue.findIndex(e => e.wake > wake);
+    if (i === -1) this.timerQueue.push(entry); else this.timerQueue.splice(i, 0, entry);
+    this._ensureTick();
+  }
+
+  // Start the loop (if not already)
+  start() {
+    if (!this.running) {
+      this.running = true;
+      this._log('[runtime] start');
+      this._ensureTick();
+    }
+  }
+
+  // Stop processing further ticks (doesn't cancel tasks)
+  stop() {
+    this.running = false;
+    this._log('[runtime] stop');
+  }
+
+  // Internal tick driver: process microtasks, timers, and one macrotask
+  _tick() {
+    this._tickScheduled = false;
+    if (!this.running) return;
+
+    // Process timers that have expired (move them to microtask queue)
+    const now = Date.now();
+    while (this.timerQueue.length && this.timerQueue[0].wake <= now) {
+      const t = this.timerQueue.shift();
+      this._enqueueMicrotask(t.task, undefined);
+      this._log(`[timer] waking ${t.task.name}`);
+    }
+
+    // Process up to maxMicroPerTick microtasks
+    let processed = 0;
+    while (this.microtaskQueue.length && processed < this.maxMicroPerTick) {
+      const entry = this.microtaskQueue.shift();
+      try {
+        entry.task._step(entry.value, entry.isError);
+      } catch (err) {
+        this._log('[runtime] error stepping task:', err);
+      }
+      processed++;
+    }
+
+    // If no microtasks pending, run a macrotask (simulating browsers' macrotask)
+    if (!this.microtaskQueue.length && this.macrotaskQueue.length) {
+      const fn = this.macrotaskQueue.shift();
+      try { fn(); } catch (e) { this._log('[macrotask] error', e); }
+    }
+
+    // Keep running if there's still work
+    if ((this.microtaskQueue.length || this.timerQueue.length || this.macrotaskQueue.length || this.tasks.size) && this.running) {
+      // schedule next tick asap but allow browser to breathe
+      this._ensureTick();
+    } else {
+      // nothing left or runtime stopped
+      if (this.running) {
+        // nothing scheduled — pause
+        this._log('[runtime] idle (no scheduled work)');
+        this.running = false;
+      }
+    }
+  }
+
+  // Ensure one scheduled tick exists
+  _ensureTick() {
+    if (!this._tickScheduled && this.running) {
+      this._tickScheduled = true;
+      // use setTimeout(0) to emulate macrotask ticks; microtask work is handled internally
+      setTimeout(() => this._tick(), 0);
+    }
+  }
+}
+
+//////////////////////////////////////////////////////////////////////
+// Demo wiring: create runtime, UI controls, sample tasks
+const logArea = document.getElementById('logArea');
+const tasksCount = document.getElementById('tasksCount');
+const microCount = document.getElementById('microCount');
+const macroCount = document.getElementById('macroCount');
+const timerCount = document.getElementById('timerCount');
+const taskList = document.getElementById('taskList');
+
+function appendLog(txt) {
+  const time = new Date().toLocaleTimeString();
+  logArea.textContent = `[${time}] ${txt}\n` + logArea.textContent;
+}
+
+const runtime = new AsyncRuntime({ logCallback: appendLog });
+
+function updateUI() {
+  tasksCount.textContent = runtime.tasks.size;
+  microCount.textContent = runtime.microtaskQueue.length;
+  macroCount.textContent = runtime.macrotaskQueue.length;
+  timerCount.textContent = runtime.timerQueue.length;
+
+  // Task list
+  taskList.innerHTML = '';
+  runtime.tasks.forEach(t => {
+    const div = document.createElement('div');
+    div.className = 'task-item';
+    const left = document.createElement('div');
+    left.innerHTML = `<div><strong>${t.name}</strong></div><div class="meta">id:${t.id} priority:${t.priority}</div>`;
+    const right = document.createElement('div');
+    right.style.display = 'flex';
+    right.style.gap = '6px';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => t.cancel();
+    right.appendChild(cancelBtn);
+    div.appendChild(left);
+    div.appendChild(right);
+    taskList.appendChild(div);
+  });
+}
+
+// Example generator tasks
+
+// CPU-bound task: does many small chunks and yields frequently
+function* cpuTask(name = 'cpu', chunks = 40, heavy = 20000) {
+  for (let c = 0; c < chunks; c++) {
+    // simulate heavy inner work
+    let s = 0;
+    for (let i = 0; i < heavy; i++) s += Math.sqrt(i + c);
+    // every chunk yield to runtime so other tasks can run
+    yield yieldNow();
+    if (c % 10 === 0) {
+      // demonstrate that tasks can log by calling runtime._log
+      runtime._log(`[${name}] progress chunk ${c}/${chunks}`);
+    }
+  }
+  return `${name} finished`;
+}
+
+// IO-bound task: sleep then wait for a Promise (simulated I/O)
+function* ioTask(name = 'io', waitMs = 1500) {
+  runtime._log(`[${name}] sleeping for ${waitMs}ms (timer)`);
+  yield sleep(waitMs);
+  runtime._log(`[${name}] after sleep — starting simulated fetch (Promise)`);
+  // simulate Promise-based I/O:
+  const res = yield new Promise(resolve => setTimeout(() => resolve(`io:${name}:result`), 300));
+  runtime._log(`[${name}] got result -> ${res}`);
+  return res;
+}
+
+// bind UI buttons
+document.getElementById('startBtn').onclick = () => { runtime.start(); updateUI(); };
+document.getElementById('stopBtn').onclick  = () => { runtime.stop(); updateUI(); };
+document.getElementById('addCpu').onclick = () => {
+  const priority = Number(document.getElementById('prioritySelect').value);
+  const id = Math.floor(Math.random()*1000);
+  runtime.spawn(() => cpuTask(`cpu-${id}`, 30, 20000), { priority, name: `cpu-${id}` });
+  runtime.start();
+  updateUI();
+};
+document.getElementById('addIo').onclick = () => {
+  const priority = Number(document.getElementById('prioritySelect').value);
+  const id = Math.floor(Math.random()*1000);
+  runtime.spawn(() => ioTask(`io-${id}`, 1000 + Math.floor(Math.random()*2000)), { priority, name: `io-${id}` });
+  runtime.start();
+  updateUI();
+};
+document.getElementById('clearLog').onclick = () => logArea.textContent = '';
+
+/* keep UI updated */
+setInterval(updateUI, 200);
+</script>
+</body>
+</html>
